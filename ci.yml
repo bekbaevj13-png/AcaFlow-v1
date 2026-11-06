@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  solver:
+    name: Solver · pytest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/solver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: services/solver/requirements.txt
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  web:
+    name: Web · typecheck, tests, build, e2e
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: acaflow
+          POSTGRES_PASSWORD: acaflow
+          POSTGRES_DB: acaflow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U acaflow"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      # CI-only values (not placeholders, so production-mode checks in env.ts stay active).
+      DATABASE_URL: postgresql://acaflow:acaflow@localhost:5432/acaflow?schema=public
+      AUTH_SECRET: ci-only-auth-secret-not-for-production-0123456789abcdef
+      SOLVER_URL: http://127.0.0.1:8000
+      SOLVER_SERVICE_TOKEN: ci-only-solver-token-0123456789abcdef
+      APP_URL: http://localhost:3000
+      STORAGE_DIR: ./storage
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: services/solver/requirements.txt
+      - name: Start solver (needed by the solver contract test)
+        working-directory: services/solver
+        run: |
+          pip install -r requirements.txt
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/solver.log 2>&1 &
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install
+        working-directory: apps/web
+        run: npm ci && npx prisma generate
+
+      - name: Migrate and seed (synthetic demo data)
+        working-directory: apps/web
+        run: npx prisma migrate deploy && npm run db:seed
+
+      - name: Format check and typecheck
+        working-directory: apps/web
+        run: npm run lint
+
+      - name: pdftotext for the PDF export checks
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+
+      - name: Unit and integration tests
+        working-directory: apps/web
+        run: |
+          curl -sf --retry 30 --retry-delay 2 --retry-all-errors http://127.0.0.1:8000/healthz
+          npx vitest run
+
+      - name: Build
+        working-directory: apps/web
+        run: npm run build
+
+      - name: E2E (full workflow + calendar operations on the fresh CI database, then read-only smoke)
+        working-directory: apps/web
+        run: |
+          npx playwright install --with-deps chromium
+          nohup npm start > /tmp/web.log 2>&1 &
+          curl -sf --retry 30 --retry-delay 2 --retry-all-errors http://localhost:3000/api/healthz
+          E2E_MUTATING=1 npx playwright test
+
+      - name: Service logs
+        if: failure()
+        run: tail -n 200 /tmp/solver.log /tmp/web.log || true

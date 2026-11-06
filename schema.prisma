@@ -1,0 +1,1372 @@
+// AcaFlow — operational data model (Phase 0–5 MVP slice).
+// Rule: every business entity carries tenantId (or is explicitly global: User).
+// Immutable snapshots / versioned rule params are JSON with a zod schema in src/lib/contracts.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  SUPER_ADMIN
+  HEAD_ACADEMIC_SECTION
+  HEAD_ACADEMIC_DEPARTMENT
+  DISPATCHER
+  FACULTY_ADMIN
+  DEPARTMENT_ADMIN
+  DEPARTMENT_HEAD
+  DEAN
+  VICE_RECTOR
+  TEACHER
+  PUBLIC_STUDENT_VIEWER
+}
+
+enum ScopeType {
+  TENANT
+  FACULTY
+  DEPARTMENT
+  SELF
+}
+
+enum ActivityType {
+  LECTURE
+  PRACTICE
+  SEMINAR
+  LAB
+}
+
+enum WeekPattern {
+  ALL
+  UPPER
+  LOWER
+}
+
+enum AvailabilityKind {
+  HARD_UNAVAILABLE
+  SOFT_UNAVAILABLE
+  PREFERRED
+}
+
+enum AudienceKind {
+  GROUP
+  SUBGROUP
+  STREAM
+}
+
+enum WorkloadStatus {
+  DRAFT
+  SUBMITTED
+  IN_APPROVAL
+  APPROVED
+  RETURNED
+}
+
+enum ScheduleStatus {
+  DRAFT
+  GENERATED
+  REVIEWED
+  PENDING_APPROVAL
+  APPROVED
+  PUBLISHED
+  SUPERSEDED
+  ARCHIVED
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum ImportStatus {
+  UPLOADED
+  PARSING
+  MAPPING
+  NEEDS_REVIEW
+  READY
+  COMMITTING
+  COMMITTED
+  FAILED
+  CANCELLED
+}
+
+enum OverrideStatus {
+  PROPOSED
+  APPROVED
+  REJECTED
+  EXPIRED
+  REVOKED
+}
+
+// ───────────────────────── Platform / identity ─────────────────────────
+
+model Tenant {
+  id            String   @id @default(uuid())
+  slug          String   @unique
+  name          String
+  shortName     String
+  timezone      String   @default("Asia/Tashkent")
+  defaultLocale String   @default("ru")
+  publicMode    String   @default("PUBLIC") // PUBLIC | TOKENIZED | PRIVATE
+  brandColor    String   @default("#2448C9")
+  settings      Json     @default("{}")
+  createdAt     DateTime @default(now())
+
+  memberships TenantMembership[]
+  faculties   Faculty[]
+}
+
+/// Global identity. Access always goes through an active TenantMembership.
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  locale       String   @default("ru")
+  createdAt    DateTime @default(now())
+
+  memberships TenantMembership[]
+}
+
+model TenantMembership {
+  id        String   @id @default(uuid())
+  tenantId  String
+  userId    String
+  active    Boolean  @default(true)
+  teacherId String?  @unique
+  createdAt DateTime @default(now())
+
+  tenant  Tenant           @relation(fields: [tenantId], references: [id])
+  user    User             @relation(fields: [userId], references: [id])
+  teacher Teacher?         @relation(fields: [teacherId], references: [id])
+  roles   RoleAssignment[]
+
+  @@unique([tenantId, userId])
+}
+
+model RoleAssignment {
+  id           String    @id @default(uuid())
+  tenantId     String
+  membershipId String
+  role         Role
+  scopeType    ScopeType @default(TENANT)
+  facultyId    String?
+  departmentId String?
+
+  membership TenantMembership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, membershipId])
+}
+
+// ───────────────────────── Academic calendar ─────────────────────────
+
+model AcademicYear {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  terms     Term[]
+
+  @@unique([tenantId, name])
+}
+
+model Term {
+  id             String       @id @default(uuid())
+  tenantId       String
+  academicYearId String
+  name           String
+  startDate      DateTime     @db.Date // Monday of week 1
+  weeks          Int
+  /// Week-type alternation is anchored on a date, not ISO parity.
+  weekAnchorDate DateTime     @db.Date
+  upperLabel     String       @default("YUQORI")
+  lowerLabel     String       @default("QUYI")
+  current        Boolean      @default(false)
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id])
+  modules        Module[]
+
+  @@index([tenantId, academicYearId])
+}
+
+model Module {
+  id       String @id @default(uuid())
+  tenantId String
+  termId   String
+  code     String
+  name     String
+  weekFrom Int
+  weekTo   Int
+  term     Term   @relation(fields: [termId], references: [id])
+
+  @@unique([tenantId, termId, code])
+}
+
+/// Slot configuration is versioned by effectiveFrom; published entries keep their own start/end snapshot.
+model TimeSlotConfig {
+  id             String     @id @default(uuid())
+  tenantId       String
+  name           String
+  effectiveFrom  DateTime   @db.Date
+  sessionMinutes Int
+  daysPerWeek    Int        @default(5)
+  active         Boolean    @default(true)
+  slots          TimeSlot[]
+}
+
+model TimeSlot {
+  id       String         @id @default(uuid())
+  tenantId String
+  configId String
+  number   Int
+  startMin Int // minutes from local midnight, interval [start, end)
+  endMin   Int
+  config   TimeSlotConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@unique([configId, number])
+}
+
+model Shift {
+  id       String @id @default(uuid())
+  tenantId String
+  code     String
+  name     String
+  slotFrom Int
+  slotTo   Int
+
+  @@unique([tenantId, code])
+}
+
+model CalendarEvent {
+  id               String   @id @default(uuid())
+  tenantId         String
+  typeCode         String // HOLIDAY | RECTOR_DAY | EXAM | CONFERENCE | REPAIR | ABSENCE | ... tenant-defined
+  title            String
+  dateFrom         DateTime @db.Date
+  dateTo           DateTime @db.Date
+  /// Optional pair range inside every day of the event (null = the whole day).
+  slotFrom         Int?
+  slotTo           Int?
+  /// {"type": TENANT|FACULTY|DEPARTMENT|PROGRAM|COURSE|GROUP|TEACHER|BUILDING|ROOM, "ids": [...]}
+  scope            Json     @default("{\"type\":\"TENANT\"}")
+  /// EXCLUDE: lessons in scope do not take place (holiday, absence, repair); INFO: shown only.
+  effect           String   @default("EXCLUDE")
+  note             String?
+  /// Set when the event was created by approving a teacher absence request.
+  absenceRequestId String?  @unique
+  createdById      String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @default(now()) @updatedAt
+
+  @@index([tenantId, dateFrom])
+}
+
+// ───────────────────────── Structure ─────────────────────────
+
+model Faculty {
+  id          String         @id @default(uuid())
+  tenantId    String
+  code        String
+  name        String
+  tenant      Tenant         @relation(fields: [tenantId], references: [id])
+  departments Department[]
+  groups      StudentGroup[]
+  programs    Program[]
+
+  @@unique([tenantId, code])
+}
+
+model Department {
+  id        String  @id @default(uuid())
+  tenantId  String
+  facultyId String
+  code      String
+  name      String
+  faculty   Faculty @relation(fields: [facultyId], references: [id])
+
+  teachers  TeacherDepartment[]
+  subjects  Subject[]
+  workloads Workload[]
+
+  @@unique([tenantId, code])
+}
+
+model EducationLevel {
+  id       String @id @default(uuid())
+  tenantId String
+  code     String
+  name     String
+
+  @@unique([tenantId, code])
+}
+
+model EducationForm {
+  id       String         @id @default(uuid())
+  tenantId String
+  code     String
+  name     String
+  groups   StudentGroup[]
+
+  @@unique([tenantId, code])
+}
+
+model ProgramKind {
+  id       String @id @default(uuid())
+  tenantId String
+  code     String
+  name     String
+
+  @@unique([tenantId, code])
+}
+
+model StudyLanguage {
+  id       String @id @default(uuid())
+  tenantId String
+  code     String
+  name     String
+
+  @@unique([tenantId, code])
+}
+
+model Program {
+  id        String         @id @default(uuid())
+  tenantId  String
+  facultyId String
+  code      String
+  name      String
+  levelId   String
+  formId    String
+  kindId    String
+  faculty   Faculty        @relation(fields: [facultyId], references: [id])
+  groups    StudentGroup[]
+  curricula Curriculum[]
+
+  @@unique([tenantId, code])
+}
+
+model StudentGroup {
+  id              String        @id @default(uuid())
+  tenantId        String
+  code            String
+  facultyId       String
+  programId       String
+  courseYear      Int
+  formId          String
+  languageCode    String
+  studentCount    Int
+  shiftId         String?
+  homeBuildingId  String?
+  preferredRoomId String?
+  tutor           String?
+  active          Boolean       @default(true)
+  /// Public friendly slug; never a substitute for token checks in TOKENIZED mode.
+  slug            String
+  publicToken     String        @default(uuid())
+  faculty         Faculty       @relation(fields: [facultyId], references: [id])
+  program         Program       @relation(fields: [programId], references: [id])
+  form            EducationForm @relation(fields: [formId], references: [id])
+  subgroups       Subgroup[]
+  streams         StreamGroup[]
+
+  @@unique([tenantId, code])
+  @@unique([tenantId, slug])
+}
+
+/// Subgroups sharing the same `partition` are declared disjoint (no common students).
+/// Subgroups from different partitions are treated as intersecting unless proven otherwise.
+model Subgroup {
+  id           String       @id @default(uuid())
+  tenantId     String
+  groupId      String
+  code         String
+  partition    String
+  studentCount Int
+  group        StudentGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, code])
+}
+
+model Stream {
+  id       String        @id @default(uuid())
+  tenantId String
+  code     String
+  name     String
+  termId   String
+  origin   String        @default("MANUAL") // AUTO | MANUAL
+  active   Boolean       @default(true)
+  groups   StreamGroup[]
+
+  @@unique([tenantId, code])
+}
+
+model StreamGroup {
+  streamId String
+  groupId  String
+  stream   Stream       @relation(fields: [streamId], references: [id], onDelete: Cascade)
+  group    StudentGroup @relation(fields: [groupId], references: [id])
+
+  @@id([streamId, groupId])
+}
+
+/// Explicit reference to who attends: a group, a subgroup or a stream composition.
+model AudienceSet {
+  id          String               @id @default(uuid())
+  tenantId    String
+  kind        AudienceKind
+  groupId     String?
+  subgroupId  String?
+  streamId    String?
+  label       String
+  assignments TeachingAssignment[]
+
+  @@index([tenantId, kind])
+}
+
+// ───────────────────────── Facilities ─────────────────────────
+
+model Building {
+  id       String  @id @default(uuid())
+  tenantId String
+  code     String
+  name     String
+  address  String?
+  rooms    Room[]
+
+  @@unique([tenantId, code])
+}
+
+/// Directed matrix; a missing value is NOT zero (falls back to tenant default or blocks).
+model TravelTime {
+  id             String @id @default(uuid())
+  tenantId       String
+  fromBuildingId String
+  toBuildingId   String
+  minutes        Int
+
+  @@unique([tenantId, fromBuildingId, toBuildingId])
+}
+
+model RoomType {
+  id       String @id @default(uuid())
+  tenantId String
+  code     String
+  name     String
+  rooms    Room[]
+
+  @@unique([tenantId, code])
+}
+
+/// A room is identified by buildingId + roomNumber, never by number alone.
+model Room {
+  id                      String          @id @default(uuid())
+  tenantId                String
+  buildingId              String
+  roomNumber              String
+  displayName             String?
+  floor                   Int?
+  nominalCapacity         Int
+  approvedMaximumCapacity Int
+  roomTypeId              String
+  equipment               String[]
+  ownerFacultyId          String?
+  active                  Boolean         @default(true)
+  notes                   String?
+  building                Building        @relation(fields: [buildingId], references: [id])
+  roomType                RoomType        @relation(fields: [roomTypeId], references: [id])
+  entries                 ScheduleEntry[]
+
+  @@unique([tenantId, buildingId, roomNumber])
+}
+
+// ───────────────────────── People ─────────────────────────
+
+/// Teacher identity is the internal ID; full name is an attribute.
+model Teacher {
+  id                  String                      @id @default(uuid())
+  tenantId            String
+  fullName            String
+  nameVariants        String[]
+  primaryDepartmentId String
+  position            String?
+  degree              String?
+  rate                Decimal?                    @db.Decimal(4, 2)
+  languages           String[]
+  guest               Boolean                     @default(false)
+  active              Boolean                     @default(true)
+  preferredBuildingId String?
+  telegram            String?
+  departments         TeacherDepartment[]
+  assignments         TeachingAssignmentTeacher[]
+  membership          TenantMembership?
+
+  @@index([tenantId, fullName])
+}
+
+model TeacherDepartment {
+  teacherId    String
+  departmentId String
+  teacher      Teacher    @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  department   Department @relation(fields: [departmentId], references: [id])
+
+  @@id([teacherId, departmentId])
+}
+
+/// Weekly availability grid for teachers, groups and rooms.
+model Availability {
+  id        String           @id @default(uuid())
+  tenantId  String
+  ownerType String // TEACHER | GROUP | ROOM
+  ownerId   String
+  day       Int
+  slot      Int
+  kind      AvailabilityKind
+  reason    String?
+
+  @@index([tenantId, ownerType, ownerId])
+}
+
+// ───────────────────────── Curriculum / workload ─────────────────────────
+
+model Subject {
+  id              String               @id @default(uuid())
+  tenantId        String
+  code            String
+  name            String
+  shortName       String
+  departmentId    String?
+  department      Department?          @relation(fields: [departmentId], references: [id])
+  assignments     TeachingAssignment[]
+  curriculumItems CurriculumItem[]
+
+  @@unique([tenantId, code])
+}
+
+/// Curriculum of one program for one intake cohort; content lives in immutable-once-approved versions.
+model Curriculum {
+  id         String              @id @default(uuid())
+  tenantId   String
+  programId  String
+  intakeYear Int
+  name       String
+  createdAt  DateTime            @default(now())
+  program    Program             @relation(fields: [programId], references: [id])
+  versions   CurriculumVersion[]
+
+  @@unique([tenantId, programId, intakeYear])
+}
+
+model CurriculumVersion {
+  id           String           @id @default(uuid())
+  tenantId     String
+  curriculumId String
+  version      Int
+  status       String           @default("DRAFT") // DRAFT | APPROVED | SUPERSEDED
+  source       String           @default("MANUAL") // MANUAL | IMPORT | COPY
+  sourceFileId String?
+  sourceName   String?
+  note         String?
+  contentHash  String?
+  createdById  String?
+  createdAt    DateTime         @default(now())
+  approvedById String?
+  approvedAt   DateTime?
+  curriculum   Curriculum       @relation(fields: [curriculumId], references: [id])
+  items        CurriculumItem[]
+
+  @@unique([curriculumId, version])
+  @@index([tenantId, status])
+}
+
+/// One discipline of one semester. Hours are raw source values (academic hours); pairs are derived by HourConversionRule.
+model CurriculumItem {
+  id                String            @id @default(uuid())
+  tenantId          String
+  versionId         String
+  subjectId         String
+  semester          Int
+  moduleCode        String?
+  kind              String            @default("MANDATORY") // MANDATORY | ELECTIVE
+  electiveBlock     String?
+  totalHours        Decimal           @default(0) @db.Decimal(7, 2)
+  lectureHours      Decimal           @default(0) @db.Decimal(7, 2)
+  seminarHours      Decimal           @default(0) @db.Decimal(7, 2)
+  practiceHours     Decimal           @default(0) @db.Decimal(7, 2)
+  labHours          Decimal           @default(0) @db.Decimal(7, 2)
+  consultationHours Decimal           @default(0) @db.Decimal(7, 2)
+  selfStudyHours    Decimal           @default(0) @db.Decimal(7, 2)
+  /// Extensible activity kinds: { "<code>": hours }
+  extraHours        Json              @default("{}")
+  control           String            @default("EXAM") // EXAM | CREDIT | DIFF_CREDIT | COURSE_WORK | NONE
+  weekFrom          Int               @default(1)
+  weekTo            Int?
+  language          String?
+  audienceKind      String            @default("GROUP") // GROUP | STREAM | SUBGROUP — for lectures
+  sourceRow         Int?
+  version           CurriculumVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  subject           Subject           @relation(fields: [subjectId], references: [id])
+
+  @@unique([versionId, subjectId, semester])
+  @@index([tenantId, versionId])
+}
+
+/// A group's choice of an elective discipline for a term. Revoked rows stay for history.
+model ElectiveChoice {
+  id               String    @id @default(uuid())
+  tenantId         String
+  termId           String
+  groupId          String
+  /// Optional: the choice applies to one subgroup only (rare divergence inside a group).
+  subgroupId       String?
+  curriculumItemId String
+  subjectId        String
+  block            String
+  source           String    @default("MANUAL") // MANUAL | BULK | IMPORT
+  createdById      String?
+  createdAt        DateTime  @default(now())
+  revokedAt        DateTime?
+  revokedById      String?
+
+  @@index([tenantId, termId, groupId])
+}
+
+/// Explicit conversion of source hours into sessions. No implicit 40/45/60-minute assumption.
+model HourConversionRule {
+  id                String        @id @default(uuid())
+  tenantId          String
+  name              String
+  sourceUnit        String // e.g. ACADEMIC_HOUR
+  sourceUnitMinutes Int
+  sessionMinutes    Int
+  roundingMode      String // CEIL | FLOOR | HALF_UP | MANUAL
+  activityType      ActivityType?
+  formCode          String?
+  effectiveFrom     DateTime      @db.Date
+  status            String        @default("PROPOSED") // PROPOSED | APPROVED
+  note              String?
+  version           Int           @default(1)
+}
+
+/// Versioned and immutable: a change creates a new version; in-flight workloads stay on their pinned version.
+model ApprovalWorkflow {
+  id          String         @id @default(uuid())
+  tenantId    String
+  code        String
+  name        String
+  version     Int            @default(1)
+  active      Boolean        @default(true)
+  createdAt   DateTime       @default(now())
+  createdById String?
+  comment     String?
+  steps       ApprovalStep[]
+
+  @@unique([tenantId, code, version])
+  @@index([tenantId, code, active])
+}
+
+model ApprovalStep {
+  id         String           @id @default(uuid())
+  tenantId   String
+  workflowId String
+  order      Int
+  role       Role
+  label      String
+  enabled    Boolean          @default(true)
+  workflow   ApprovalWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@unique([workflowId, order])
+}
+
+/// Department workload document for a term — the unit of approval.
+model Workload {
+  id              String               @id @default(uuid())
+  tenantId        String
+  departmentId    String
+  termId          String
+  revision        Int                  @default(1)
+  status          WorkloadStatus       @default(DRAFT)
+  workflowId      String?
+  workflowVersion Int?
+  currentStep     Int?
+  snapshotHash    String?
+  frozenPayload   Json?
+  submittedAt     DateTime?
+  approvedAt      DateTime?
+  previousId      String?
+  createdAt       DateTime             @default(now())
+  department      Department           @relation(fields: [departmentId], references: [id])
+  assignments     TeachingAssignment[]
+  actions         ApprovalAction[]
+
+  @@index([tenantId, status])
+}
+
+/// Append-only: signatures and transitions never mutate the signed payload.
+model ApprovalAction {
+  id                String    @id @default(uuid())
+  tenantId          String
+  workloadId        String?
+  scheduleVersionId String?
+  stepOrder         Int?
+  action            String // SUBMIT | SIGN | RETURN | APPROVE | PUBLISH
+  actorUserId       String
+  actorName         String
+  actingRole        Role
+  scopeType         ScopeType
+  comment           String?
+  payloadHash       String
+  eimzoMeta         Json?
+  createdAt         DateTime  @default(now())
+  workload          Workload? @relation(fields: [workloadId], references: [id])
+
+  @@index([tenantId, createdAt])
+}
+
+model TeachingAssignment {
+  id                     String                      @id @default(uuid())
+  tenantId               String
+  workloadId             String
+  termId                 String
+  moduleCode             String?
+  departmentId           String
+  subjectId              String
+  audienceSetId          String
+  activityType           ActivityType
+  rawHours               Decimal                     @db.Decimal(7, 2)
+  sourceUnit             String                      @default("ACADEMIC_HOUR")
+  conversionRuleId       String?
+  calculatedSessionCount Int?
+  minuteDelta            Int?
+  sessionsPerWeek        Int
+  weekFrom               Int
+  weekTo                 Int
+  weekPattern            WeekPattern                 @default(ALL)
+  language               String
+  roomTypeCode           String?
+  requiredEquipment      String[]
+  notes                  String?
+  sourceImportRowId      String?
+  /// Set when the assignment was generated from an approved curriculum item.
+  curriculumItemId       String?
+  createdAt              DateTime                    @default(now())
+  workload               Workload                    @relation(fields: [workloadId], references: [id])
+  subject                Subject                     @relation(fields: [subjectId], references: [id])
+  audienceSet            AudienceSet                 @relation(fields: [audienceSetId], references: [id])
+  teachers               TeachingAssignmentTeacher[]
+  sessions               TeachingSession[]
+
+  @@index([tenantId, termId])
+  @@index([tenantId, moduleCode])
+  @@index([tenantId, curriculumItemId])
+}
+
+model TeachingAssignmentTeacher {
+  assignmentId String
+  teacherId    String
+  role         String             @default("PRIMARY") // PRIMARY | CO_TEACHER
+  loadShare    Decimal            @default(1) @db.Decimal(4, 2)
+  assignment   TeachingAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  teacher      Teacher            @relation(fields: [teacherId], references: [id])
+
+  @@id([assignmentId, teacherId])
+}
+
+/// MVP: a TeachingSession is a stable weekly series obligation (ordinal k of sessionsPerWeek).
+/// Dated occurrences are materialised from the term calendar on read (see docs/decisions.md D-MVP-1).
+model TeachingSession {
+  id              String             @id @default(uuid())
+  tenantId        String
+  assignmentId    String
+  ordinal         Int
+  durationMinutes Int
+  assignment      TeachingAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  entries         ScheduleEntry[]
+
+  @@unique([assignmentId, ordinal])
+}
+
+model SessionDependency {
+  id            String @id @default(uuid())
+  tenantId      String
+  predecessorId String
+  successorId   String
+  minGapMinutes Int    @default(0)
+
+  @@unique([predecessorId, successorId])
+}
+
+// ───────────────────────── Constraints ─────────────────────────
+
+model ConstraintProfile {
+  id       String                     @id @default(uuid())
+  tenantId String
+  name     String
+  active   Boolean                    @default(true)
+  versions ConstraintProfileVersion[]
+}
+
+model ConstraintProfileVersion {
+  id             String            @id @default(uuid())
+  tenantId       String
+  profileId      String
+  version        Int
+  scoringVersion String            @default("1")
+  rules          Json
+  createdById    String?
+  createdAt      DateTime          @default(now())
+  profile        ConstraintProfile @relation(fields: [profileId], references: [id])
+
+  @@unique([profileId, version])
+}
+
+model ConstraintOverride {
+  id           String         @id @default(uuid())
+  tenantId     String
+  ruleCode     String
+  ruleVersion  String         @default("1")
+  scope        Json
+  relatedIds   String[]
+  numericLimit Int?
+  reason       String
+  comment      String?
+  status       OverrideStatus @default(PROPOSED)
+  severity     String
+  oneTime      Boolean        @default(true)
+  versionId    String?
+  createdById  String
+  approvedById String?
+  createdAt    DateTime       @default(now())
+  expiresAt    DateTime?
+
+  @@index([tenantId, status])
+}
+
+// ───────────────────────── Schedule ─────────────────────────
+
+model ScheduleVersion {
+  id              String          @id @default(uuid())
+  tenantId        String
+  termId          String
+  number          Int
+  name            String
+  status          ScheduleStatus  @default(DRAFT)
+  revision        Int             @default(0)
+  basedOnId       String?
+  sourceRunId     String?
+  sourceVariantId String?
+  payloadHash     String?
+  /// approval workflow version pinned at submission
+  workflowId      String?
+  score           Float?
+  metrics         Json?
+  effectiveFrom   DateTime?       @db.Date
+  publishedAt     DateTime?
+  createdById     String
+  createdAt       DateTime        @default(now())
+  entries         ScheduleEntry[]
+
+  @@unique([tenantId, termId, number])
+  @@index([tenantId, status])
+}
+
+model ScheduleEntry {
+  id          String          @id @default(uuid())
+  tenantId    String
+  versionId   String
+  sessionId   String
+  day         Int
+  slot        Int
+  startMin    Int
+  endMin      Int
+  roomId      String
+  locked      Boolean         @default(false)
+  movedFrom   Json?
+  updatedAt   DateTime        @updatedAt
+  updatedById String?
+  version     ScheduleVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  session     TeachingSession @relation(fields: [sessionId], references: [id])
+  room        Room            @relation(fields: [roomId], references: [id])
+
+  @@unique([versionId, sessionId])
+  @@index([versionId, day, slot])
+  @@index([roomId])
+}
+
+model Publication {
+  id             String   @id @default(uuid())
+  tenantId       String
+  versionId      String   @unique
+  publishedById  String
+  publishedAt    DateTime @default(now())
+  effectiveFrom  DateTime @db.Date
+  payloadHash    String
+  payload        Json
+  summary        Json
+  idempotencyKey String
+
+  @@unique([tenantId, idempotencyKey])
+}
+
+model TeacherAck {
+  id          String    @id @default(uuid())
+  tenantId    String
+  teacherId   String
+  versionId   String
+  viewedAt    DateTime  @default(now())
+  confirmedAt DateTime?
+
+  @@unique([teacherId, versionId])
+}
+
+model AbsenceRequest {
+  id            String    @id @default(uuid())
+  tenantId      String
+  teacherId     String
+  dateFrom      DateTime  @db.Date
+  dateTo        DateTime  @db.Date
+  reason        String
+  status        String    @default("SUBMITTED") // SUBMITTED | APPROVED | REJECTED
+  createdById   String?
+  reviewedById  String?
+  reviewedAt    DateTime?
+  reviewComment String?
+  createdAt     DateTime  @default(now())
+
+  @@index([tenantId, status])
+}
+
+/// Operational change of one dated occurrence of the published timetable (§26). Append-only: only the
+/// revocation columns may change. Occurrence identity = (sessionId, week) of the source publication, so a
+/// moved or restored lesson is still the same obligation. Teacher substitution is not a change kind.
+model ScheduleChange {
+  id              String    @id @default(uuid())
+  tenantId        String
+  publicationId   String
+  versionId       String
+  sessionId       String
+  week            Int
+  kind            String // CANCEL | MOVE | ROOM | RESTORE
+  originalDate    DateTime  @db.Date
+  originalSlot    Int
+  originalRoomId  String
+  newDate         DateTime? @db.Date
+  newSlot         Int?
+  newRoomId       String?
+  /// earliest calendar date touched by the change
+  effectiveDate   DateTime  @db.Date
+  reason          String
+  calendarEventId String?
+  rescheduleJobId String?
+  /// RESTORE → the CANCEL change it compensates
+  restoresId      String?
+  status          String    @default("ACTIVE") // ACTIVE | REVOKED
+  before          Json
+  after           Json
+  createdById     String
+  createdAt       DateTime  @default(now())
+  revokedById     String?
+  revokedAt       DateTime?
+  revokeReason    String?
+
+  @@index([tenantId, publicationId, status])
+  @@index([tenantId, sessionId])
+  @@index([tenantId, effectiveDate])
+}
+
+/// Proposal to move the lessons blocked by a calendar event (§27); applying it creates MOVE changes.
+model RescheduleJob {
+  id              String    @id @default(uuid())
+  tenantId        String
+  calendarEventId String
+  publicationId   String
+  status          String    @default("PROPOSED") // PROPOSED | APPLIED | DISCARDED
+  algorithm       String    @default("greedy-v1")
+  proposals       Json
+  summary         Json
+  createdById     String
+  createdAt       DateTime  @default(now())
+  closedById      String?
+  closedAt        DateTime?
+
+  @@index([tenantId, calendarEventId])
+}
+
+/// Fact of a lesson (§28): one row per occurrence identity (sessionId, week) — a moved or re-published lesson
+/// is never counted twice. Corrections update the row and are audited.
+model LessonFact {
+  id            String    @id @default(uuid())
+  tenantId      String
+  sessionId     String
+  week          Int
+  /// placement known when the fact was recorded
+  publicationId String
+  versionId     String
+  changeId      String?
+  heldDate      DateTime  @db.Date
+  slot          Int
+  status        String // CONDUCTED | NOT_HELD
+  note          String?
+  recordedById  String
+  recordedAt    DateTime  @default(now())
+  updatedAt     DateTime  @default(now()) @updatedAt
+  confirmedById String?
+  confirmedAt   DateTime?
+
+  @@unique([tenantId, sessionId, week])
+  @@index([tenantId, heldDate])
+}
+
+/// Each upload is a new version row; approval/rejection is recorded on the row (never overwritten by a new upload).
+model Syllabus {
+  id                  String    @id @default(uuid())
+  tenantId            String
+  subjectId           String
+  teacherId           String
+  departmentId        String?
+  academicYearId      String?
+  programId           String?
+  /// curriculum version the syllabus was written for (optional; §9)
+  curriculumVersionId String?
+  language            String
+  version             Int       @default(1)
+  status              String    @default("UPLOADED") // UPLOADED | APPROVED | REJECTED | SUPERSEDED
+  fileId              String?
+  uploadedById        String?
+  reviewedById        String?
+  reviewedAt          DateTime?
+  reviewComment       String?
+  createdAt           DateTime  @default(now())
+
+  @@index([tenantId, subjectId])
+  @@index([tenantId, teacherId])
+  @@index([tenantId, status])
+}
+
+/// Exam timetable of a term. Versions are immutable once published; a new draft copies the last version.
+model ExamSchedule {
+  id            String      @id @default(uuid())
+  tenantId      String
+  termId        String
+  version       Int
+  name          String
+  status        String      @default("DRAFT") // DRAFT | PUBLISHED | SUPERSEDED
+  source        String      @default("MANUAL") // MANUAL | IMPORT | COPY
+  sourceFileId  String?
+  previousId    String?
+  contentHash   String?
+  createdById   String?
+  createdAt     DateTime    @default(now())
+  publishedById String?
+  publishedAt   DateTime?
+  entries       ExamEntry[]
+
+  @@unique([tenantId, termId, version])
+}
+
+model ExamEntry {
+  id          String       @id @default(uuid())
+  tenantId    String
+  scheduleId  String
+  groupId     String
+  subjectId   String
+  kind        String       @default("EXAM") // EXAM | CREDIT | CONSULTATION | RETAKE
+  date        DateTime     @db.Date
+  startMin    Int
+  durationMin Int          @default(120)
+  roomIds     String[]
+  examinerIds String[]
+  notes       String?
+  sourceRow   Int?
+  schedule    ExamSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, scheduleId])
+  @@index([tenantId, date])
+}
+
+model Notification {
+  id            String    @id @default(uuid())
+  tenantId      String
+  userId        String?
+  teacherId     String?
+  publicationId String?
+  channel       String    @default("WEB")
+  deliveryKey   String    @unique
+  status        String    @default("PENDING")
+  title         String
+  body          Json
+  readAt        DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([tenantId, userId])
+}
+
+model OutboxEvent {
+  id          String    @id @default(uuid())
+  tenantId    String
+  type        String
+  payload     Json
+  status      String    @default("PENDING")
+  attempts    Int       @default(0)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([status, createdAt])
+}
+
+// ───────────────────────── Solver ─────────────────────────
+
+model SolverRun {
+  id                    String          @id @default(uuid())
+  tenantId              String
+  mode                  String // FULL | PARTIAL | RESCHEDULE
+  termId                String
+  baseVersionId         String?
+  baseRevision          Int?
+  scope                 Json?
+  requestedVariantCount Int
+  timeLimitSeconds      Int
+  seed                  Int
+  workers               Int
+  jobStatus             JobStatus       @default(QUEUED)
+  solverStatus          String?
+  stopReason            String?
+  snapshotHash          String
+  snapshot              Json
+  progress              Json            @default("{}")
+  diagnostics           Json?
+  error                 String?
+  attempt               Int             @default(1)
+  idempotencyKey        String
+  createdById           String
+  createdAt             DateTime        @default(now())
+  startedAt             DateTime?
+  finishedAt            DateTime?
+  durationMs            Int?
+  variants              SolverVariant[]
+
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, createdAt])
+}
+
+model SolverVariant {
+  id             String    @id @default(uuid())
+  tenantId       String
+  runId          String
+  index          Int
+  fingerprint    String
+  objective      Float
+  bound          Float?
+  score          Float
+  scoringVersion String
+  metrics        Json
+  violations     Json
+  entries        Json
+  hardConflicts  Int
+  unplaced       Int
+  verified       Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  run            SolverRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, fingerprint])
+}
+
+// ───────────────────────── Import / storage / audit ─────────────────────────
+
+model StoredFile {
+  id           String   @id @default(uuid())
+  tenantId     String
+  sha256       String
+  size         Int
+  mime         String
+  originalName String
+  storageKey   String
+  createdById  String
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId, sha256])
+}
+
+model ImportBatch {
+  id             String       @id @default(uuid())
+  tenantId       String
+  kind           String       @default("WORKLOAD")
+  status         ImportStatus @default(UPLOADED)
+  fileId         String
+  fileName       String
+  fileSha256     String
+  sheetName      String?
+  headerRow      Int?
+  mapping        Json?
+  decisions      Json?
+  previewHash    String?
+  stats          Json?
+  departmentId   String?
+  termId         String?
+  workloadId     String?
+  uploadedById   String
+  idempotencyKey String?
+  createdAt      DateTime     @default(now())
+  committedAt    DateTime?
+  rows           ImportRow[]
+
+  @@index([tenantId, status])
+}
+
+model ImportRow {
+  id         String      @id @default(uuid())
+  tenantId   String
+  batchId    String
+  sheet      String
+  rowNumber  Int
+  raw        Json
+  normalized Json?
+  status     String // VALID | WARNING | ERROR | SKIPPED
+  issues     Json        @default("[]")
+  targetIds  Json?
+  batch      ImportBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@index([batchId, rowNumber])
+}
+
+model MappingTemplate {
+  id          String   @id @default(uuid())
+  tenantId    String
+  name        String
+  mapping     Json
+  createdById String
+  createdAt   DateTime @default(now())
+}
+
+model IdempotencyKey {
+  id        String   @id @default(uuid())
+  tenantId  String
+  scope     String
+  key       String
+  resultRef String?
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, scope, key])
+}
+
+/// Append-only (UPDATE/DELETE blocked by DB trigger in migration).
+model AuditLog {
+  id                BigInt   @id @default(autoincrement())
+  tenantId          String
+  actorUserId       String?
+  actorName         String
+  action            String
+  entityType        String
+  entityId          String
+  before            Json?
+  after             Json?
+  reason            String?
+  scheduleVersionId String?
+  correlationId     String?
+  createdAt         DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, entityType, entityId])
+}
+
+/// An imported source kept separate from live groups until all mappings are reviewed.
+model DirectoryBookImport {
+  id               String   @id @default(uuid())
+  tenantId         String
+  sourceName       String
+  sourceSha256     String
+  sourceStorageKey String
+  status           String   @default("NEEDS_REVIEW")
+  payload          Json
+  createdAt        DateTime @default(now())
+
+  @@unique([tenantId, sourceSha256])
+  @@index([tenantId, createdAt])
+}
+
+/// Raw academic source archive staged only for verification, separate from live plans and choices.
+model AcademicSourceImport {
+  id               String   @id @default(uuid())
+  tenantId         String
+  kind             String
+  sourceName       String
+  sourceSha256     String
+  sourceStorageKey String
+  status           String   @default("NEEDS_REVIEW")
+  payload          Json
+  createdAt        DateTime @default(now())
+
+  @@unique([tenantId, kind, sourceSha256])
+  @@index([tenantId, kind, createdAt])
+}
+
+/// User corrections to one extracted candidate; source artifacts remain immutable.
+model AcademicSourceCorrection {
+  id          String   @id @default(uuid())
+  tenantId    String
+  sourceId    String
+  fileId      String
+  candidateId String
+  data        Json
+  revision    Int      @default(1)
+  updatedById String
+  updatedAt   DateTime @updatedAt
+
+  @@unique([tenantId, sourceId, fileId, candidateId])
+  @@index([tenantId, sourceId, fileId])
+}
+
+/// One explicit, audited transfer of a reviewed source candidate to an elective choice.
+model AcademicSourcePromotion {
+  id           String   @id @default(uuid())
+  tenantId     String
+  correctionId String
+  termId       String
+  groupId      String
+  subjectId    String
+  block        String
+  choiceId     String
+  createdById  String
+  createdAt    DateTime @default(now())
+
+  @@unique([tenantId, correctionId])
+  @@index([tenantId, groupId, termId])
+}
+
+/// One reviewed source row copied into a specific draft curriculum semester.
+model AcademicCurriculumPromotion {
+  id           String   @id @default(uuid())
+  tenantId     String
+  correctionId String
+  versionId    String
+  itemId       String
+  semester     Int
+  createdById  String
+  createdAt    DateTime @default(now())
+
+  @@unique([tenantId, correctionId, versionId, semester])
+  @@index([tenantId, versionId])
+}
+
+/// Explicitly confirmed link from a book row to a live group or stream; original source stays untouched.
+model DirectoryBookLink {
+  id          String   @id @default(uuid())
+  tenantId    String
+  batchId     String
+  kind        String
+  sourceRowId String
+  targetId    String
+  snapshot    Json
+  updatedById String
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@unique([tenantId, batchId, kind, sourceRowId])
+  @@unique([tenantId, batchId, kind, targetId])
+  @@index([tenantId, batchId, kind])
+}

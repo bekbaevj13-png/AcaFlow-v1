@@ -1,0 +1,41 @@
+# Local demo stack: PostgreSQL 16 + solver + web. Synthetic demo data only.
+# Usage: cp .env.compose.example .env && docker compose up --build
+#        docker compose exec -e ALLOW_DEMO_SEED=1 web npm run db:seed   (synthetic demo data)
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: acaflow
+      POSTGRES_PASSWORD: acaflow
+      POSTGRES_DB: acaflow
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acaflow -d acaflow"]
+      interval: 5s
+      retries: 20
+
+  solver:
+    build: ./services/solver
+    environment:
+      SOLVER_SERVICE_TOKEN: ${SOLVER_SERVICE_TOKEN:?set SOLVER_SERVICE_TOKEN in .env}
+      SOLVER_CONCURRENCY: "1"
+
+  web:
+    build: ./apps/web
+    depends_on:
+      db: { condition: service_healthy }
+      solver: { condition: service_started }
+    environment:
+      DATABASE_URL: postgresql://acaflow:acaflow@db:5432/acaflow?schema=public
+      AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET in .env (32+ chars)}
+      SOLVER_URL: http://solver:8000
+      SOLVER_SERVICE_TOKEN: ${SOLVER_SERVICE_TOKEN}
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      SOLVER_CALLBACK_BASE: http://web:3000
+      STORAGE_DIR: /data/storage
+    ports: ["127.0.0.1:3000:3000"]
+    volumes: [storage:/data/storage]
+
+volumes:
+  pgdata:
+  storage:
